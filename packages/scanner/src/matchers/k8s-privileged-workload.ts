@@ -15,7 +15,11 @@ const WORKLOAD_KINDS = new Set([
   "StatefulSet",
 ]);
 
-const TRUE = "(?:true|True|TRUE)";
+// Kubernetes decodes manifests as YAML 1.1 (sigs.k8s.io/yaml), so `yes`, `on` and `y` are true too.
+const TRUE = "(?:y|Y|yes|Yes|YES|true|True|TRUE|on|On|ON)";
+
+// Quoted, these are strings, which Kubernetes rejects for boolean and integer fields.
+const QUOTED_NON_STRING = new RegExp(String.raw`^(?:${TRUE}|[-+]?\d+)$`);
 
 // Matches `key: value` as a block mapping entry or inside a flow map such as `{key: value}`.
 function field(key: string, value: string): RegExp {
@@ -44,12 +48,14 @@ const BLOCK_METADATA = /^(\s*(?:-\s+)?)metadata\s*:\s*$/;
 type Document = { lines: string[]; lineOffset: number; kind: string };
 
 // Unquotes simple quoted tokens, empties other quoted scalars, and drops comments, so text
-// inside strings or comments can't pass for a mapping entry.
+// inside strings or comments can't pass for a mapping entry. A quoted `"true"` or `"0"` is
+// emptied too, so a label like `privileged: "true"` isn't read as the boolean setting.
 function structuralText(line: string): string {
   return line
-    .replace(/"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'/g, (quoted) =>
-      /^[\w./-]+$/.test(quoted.slice(1, -1)) ? quoted.slice(1, -1) : '""',
-    )
+    .replace(/"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'/g, (quoted) => {
+      const text = quoted.slice(1, -1);
+      return /^[\w./-]+$/.test(text) && !QUOTED_NON_STRING.test(text) ? text : '""';
+    })
     .replace(/(?:^|\s)#.*$/, "");
 }
 

@@ -400,20 +400,43 @@ spec:
     ).toHaveLength(1);
   });
 
-  it("accepts capitalized true but not other YAML 1.1 booleans", () => {
+  it("accepts every YAML 1.1 spelling of true", () => {
     const content = `apiVersion: v1
 kind: Pod
 spec:
   hostNetwork: TRUE
   hostPID: yes
+  hostIPC: n
   containers:
     - securityContext:
         privileged: True
-        allowPrivilegeEscalation: on`;
+        allowPrivilegeEscalation: on
+        windowsOptions: {hostProcess: Y}`;
     const matches = k8sPrivilegedWorkloadMatcher.match(content, "deploy/pod.yaml");
     expect(matches.map((match) => [match.matchedPattern, match.lineNumbers])).toEqual([
-      ["privileged container", [8]],
-      ["host namespace shared", [4]],
+      ["privileged container", [9]],
+      ["privilege escalation allowed", [10]],
+      ["host namespace shared", [4, 5]],
+      ["Windows host process container", [11]],
+    ]);
+  });
+
+  it("ignores quoted true and 0, which are strings such as label values", () => {
+    const content = `apiVersion: apps/v1
+kind: Deployment
+spec:
+  selector:
+    matchLabels: {hostNetwork: "true"}
+  template:
+    spec:
+      nodeSelector:
+        privileged: "true"
+        runAsUser: '0'
+      containers:
+        - securityContext: {privileged: true}`;
+    const matches = k8sPrivilegedWorkloadMatcher.match(content, "deploy/app.yaml");
+    expect(matches.map((match) => [match.matchedPattern, match.lineNumbers])).toEqual([
+      ["privileged container", [12]],
     ]);
   });
 
