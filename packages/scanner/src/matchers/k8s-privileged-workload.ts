@@ -1,4 +1,6 @@
 import type { CandidateMatch } from "@deepsec/core";
+import type { Alias, Document, Node } from "yaml";
+import { isAlias, isMap, isScalar, isSeq, LineCounter, parseAllDocuments } from "yaml";
 import type { MatcherPlugin } from "../types.js";
 
 const WORKLOAD_KINDS = new Set([
@@ -14,241 +16,72 @@ const WORKLOAD_KINDS = new Set([
   "Rollout",
   "StatefulSet",
 ]);
-
-// Kubernetes decodes manifests as YAML 1.1 (sigs.k8s.io/yaml), so `yes`, `on` and `y` are true too.
-const TRUE = "(?:y|Y|yes|Yes|YES|true|True|TRUE|on|On|ON)";
-
-// Quoted, these are strings, which Kubernetes rejects for boolean and integer fields.
-const QUOTED_NON_STRING = new RegExp(String.raw`^(?:${TRUE}|[-+]?\d+)$`);
-
-// Matches `key: value` as a block mapping entry or inside a flow map such as `{key: value}`.
-function field(key: string, value: string): RegExp {
-  return new RegExp(String.raw`(?:^\s*(?:-\s+)?|[{,]\s*)${key}\s*:\s*${value}\s*(?:[,}]|$)`);
-}
-
-const PATTERNS = [
-  { regex: field("privileged", TRUE), label: "privileged container" },
-  { regex: field("allowPrivilegeEscalation", TRUE), label: "privilege escalation allowed" },
-  { regex: field("host(?:IPC|Network|PID)", TRUE), label: "host namespace shared" },
-  { regex: field("hostProcess", TRUE), label: "Windows host process container" },
-  { regex: field("runAsUser", "0"), label: "container runs as root UID" },
-  { regex: field("hostPath", ".*"), label: "host filesystem mount" },
-  { regex: field("procMount", "Unmasked"), label: "unmasked proc mount" },
+const LABELS = [
+  "privileged container",
+  "privilege escalation allowed",
+  "host namespace shared",
+  "Windows host process container",
+  "container runs as root UID",
+  "host filesystem mount",
+  "unmasked proc mount",
+  "dangerous Linux capability",
 ];
+const DANGEROUS_CAPABILITIES = new Set([
+  "ALL",
+  "BPF",
+  "DAC_READ_SEARCH",
+  "NET_ADMIN",
+  "SYS_ADMIN",
+  "SYS_MODULE",
+  "SYS_PTRACE",
+  "SYS_RAWIO",
+]);
+const MAX_CONTENT_LENGTH = 1024 * 1024;
+const MAX_LOCATIONS = 64;
+const MAX_WORKLOADS = 100_000;
 
-const CAPABILITY_LABEL = "dangerous Linux capability";
-const LABELS = [...PATTERNS.map(({ label }) => label), CAPABILITY_LABEL];
-
-const DANGEROUS_CAPABILITY =
-  /(?:^|[,\s])(?:ALL|BPF|DAC_READ_SEARCH|NET_ADMIN|SYS_ADMIN|SYS_MODULE|SYS_PTRACE|SYS_RAWIO)(?=$|[,\s])/;
-
-const BLOCK_SCALAR = /^(\s*)(?:\S.*:|-)\s*[|>](?:[1-9][+-]?|[+-][1-9]?)?\s*$/;
-const BLOCK_METADATA = /^(\s*(?:-\s+)?)metadata\s*:\s*$/;
-
-type Document = { lines: string[]; lineOffset: number; kind: string };
-
-// Unquotes simple quoted tokens, empties other quoted scalars, and drops comments, so text
-// inside strings or comments can't pass for a mapping entry. A quoted `"true"` or `"0"` is
-// emptied too, so a label like `privileged: "true"` isn't read as the boolean setting.
-function structuralText(line: string): string {
-  return line
-    .replace(/"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'/g, (quoted) => {
-      const text = quoted.slice(1, -1);
-      return /^[\w./-]+$/.test(text) && !QUOTED_NON_STRING.test(text) ? text : '""';
-    })
-    .replace(/(?:^|\s)#.*$/, "");
-}
-
-function leadingIndent(line: string): number {
-  return line.match(/^\s*/)?.[0].length ?? 0;
-}
-
-function isStructuralLine(line: string): boolean {
-  return Boolean(line.trim()) && !/^\s*{{.*}}\s*$/.test(line);
-}
-
-function topLevelIndent(lines: string[]): number | undefined {
-  let indent: number | undefined;
-  for (const line of lines) {
-    if (isStructuralLine(line)) indent = Math.min(indent ?? Infinity, leadingIndent(line));
-  }
-  return indent;
-}
-
-function topLevelLines(lines: string[]): string[] {
-  const rootIndent = topLevelIndent(lines);
-  return lines.filter((line) => isStructuralLine(line) && leadingIndent(line) === rootIndent);
-}
-
-function isFlowDocument(lines: string[]): boolean {
-  return lines.find(isStructuralLine)?.trimStart().startsWith("{") ?? false;
-}
-
-// Top-level `key: value` entries of a flow document such as `{kind: Pod, spec: {...}}`.
-function flowEntries(text: string): string[] {
-  let depth = 0;
-  let topLevel = "";
-  for (const char of text) {
-    if (char === "{" || char === "[") depth++;
-    else if (char === "}" || char === "]") depth--;
-    else if (depth === 1) topLevel += char;
-  }
-  return topLevel.split(",");
-}
-
-function documentKind(lines: string[]): string | undefined {
-  const entries = isFlowDocument(lines) ? flowEntries(lines.join("\n")) : topLevelLines(lines);
-  if (!entries.some((entry) => /^\s*apiVersion\s*:/.test(entry))) return undefined;
-  return entries
-    .map((entry) => entry.match(/^\s*kind\s*:\s*([\w.-]+)\s*$/)?.[1])
-    .find((kind) => kind !== undefined);
-}
-
-function listItems(lines: string[]): Omit<Document, "kind">[] {
-  const rootIndent = topLevelIndent(lines);
-  const itemsIndex = lines.findIndex(
-    (line) => leadingIndent(line) === rootIndent && /^\s*items\s*:\s*$/.test(line),
-  );
-  if (itemsIndex === -1) return [];
-
-  const starts: number[] = [];
-  let end = lines.length;
-  let itemIndent: number | undefined;
-  for (let i = itemsIndex + 1; i < lines.length; i++) {
-    if (!isStructuralLine(lines[i])) continue;
-    const indent = leadingIndent(lines[i]);
-    const isEntry = /^\s*-(?:\s|$)/.test(lines[i]);
-    itemIndent ??= indent;
-    if (indent < itemIndent || (indent === itemIndent && !isEntry)) {
-      end = i;
-      break;
-    }
-    if (indent === itemIndent) starts.push(i);
-  }
-
-  return starts.map((start, index) => {
-    const itemLines = lines.slice(start, starts[index + 1] ?? end);
-    itemLines[0] = itemLines[0].replace(/^(\s*)-/, "$1 ");
-    return { lines: itemLines, lineOffset: start };
-  });
-}
-
-// Items of a typed list such as PodList may omit apiVersion and kind, so they inherit one.
-function workloads(lines: string[], lineOffset: number, itemKind?: string): Document[] {
-  const kind = documentKind(lines) ?? itemKind;
-  if (kind?.endsWith("List")) {
-    return listItems(lines).flatMap((item) =>
-      workloads(item.lines, lineOffset + item.lineOffset, kind.slice(0, -4) || undefined),
-    );
-  }
-  return kind !== undefined && WORKLOAD_KINDS.has(kind) ? [{ lines, lineOffset, kind }] : [];
-}
-
-function workloadDocuments(lines: string[]): Document[] {
-  const documents: Document[] = [];
-  let start = 0;
-  for (let i = 0; i <= lines.length; i++) {
-    if (i < lines.length && !/^---\s*$/.test(lines[i])) continue;
-    documents.push(...workloads(lines.slice(start, i), start));
-    start = i + 1;
-  }
-  return documents;
-}
-
-// A PodTemplate keeps its pod settings under top-level `template` instead of `spec`.
-function podSettingLines({ lines, kind }: Document): string[] {
-  if (isFlowDocument(lines)) return lines;
-
-  const rootIndent = topLevelIndent(lines);
-  const rootKey = new RegExp(String.raw`^\s*${kind === "PodTemplate" ? "template" : "spec"}\s*:`);
-  const specIndex = lines.findIndex(
-    (line) => leadingIndent(line) === rootIndent && rootKey.test(line),
-  );
-  if (specIndex === -1) return lines.map(() => "");
-
-  let inSpec = true;
-  return lines.map((line, index) => {
-    if (index < specIndex || !inSpec) return "";
-    if (index === specIndex || !isStructuralLine(line)) return line;
-    if (leadingIndent(line) <= rootIndent!) {
-      inSpec = false;
-      return "";
-    }
-    return line;
-  });
-}
-
-// Blanks the lines nested under each line matching `opener`, whose first group is the parent indent.
-function withoutNested(lines: string[], opener: RegExp): string[] {
-  let parentIndent: number | undefined;
-  return lines.map((line) => {
-    if (parentIndent !== undefined) {
-      if (!isStructuralLine(line) || leadingIndent(line) > parentIndent) return "";
-      parentIndent = undefined;
-    }
-    parentIndent = line.match(opener)?.[1].length;
-    return line;
-  });
-}
-
-function withoutFlowMetadata(lines: string[]): string[] {
-  const text = lines.join("\n");
-  const metadata = /(?:^|[\s{,])metadata\s*:\s*\{/g;
-  let result = "";
-  let copied = 0;
-  for (let match = metadata.exec(text); match; match = metadata.exec(text)) {
-    const open = match.index + match[0].length - 1;
-    let close = open;
-    for (let depth = 0; close < text.length; close++) {
-      if (text[close] === "{") depth++;
-      else if (text[close] === "}" && --depth === 0) break;
-    }
-    result += text.slice(copied, open + 1) + text.slice(open + 1, close).replace(/[^\n]/g, " ");
-    copied = close;
-    metadata.lastIndex = close;
-  }
-  return (result + text.slice(copied)).split("\n");
-}
-
-function parentIsCapabilities(lines: string[], lineIndex: number, indent: number): boolean {
-  for (let i = lineIndex - 1; i >= 0; i--) {
-    if (!isStructuralLine(lines[i]) || leadingIndent(lines[i]) >= indent) continue;
-    return /^\s*capabilities\s*:\s*$/.test(lines[i]);
-  }
-  return false;
-}
-
-function dangerousCapabilityLines(lines: string[]): number[] {
-  const hitLines: number[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const flow = lines[i].match(/\bcapabilities\s*:\s*\{.*?\badd\s*:\s*\[([^\]]*)\]/);
-    if (flow) {
-      if (DANGEROUS_CAPABILITY.test(flow[1])) hitLines.push(i + 1);
-      continue;
-    }
-
-    const add = lines[i].match(/^(\s*)add\s*:\s*(.*)$/);
-    if (!add || !parentIsCapabilities(lines, i, add[1].length)) continue;
-
-    const value = add[2].trim();
-    const inline = value.match(/^\[([^\]]*)\]/);
-    if (inline) {
-      if (DANGEROUS_CAPABILITY.test(inline[1])) hitLines.push(i + 1);
-    } else if (!value) {
-      for (let j = i + 1; j < lines.length; j++) {
-        if (!isStructuralLine(lines[j])) continue;
-        const indent = leadingIndent(lines[j]);
-        const isSequenceEntry = /^\s*-/.test(lines[j]);
-        if (indent < add[1].length) break;
-        if (indent === add[1].length && !isSequenceEntry) break;
-        const entry = lines[j].match(/^\s*-\s*(.*)/);
-        if (entry && DANGEROUS_CAPABILITY.test(entry[1])) hitLines.push(j + 1);
+// Resolve aliases once in source order without expanding their object graphs.
+function aliasTargets(document: Document): WeakMap<Alias, Node> {
+  const targets = new WeakMap<Alias, Node>();
+  const anchors = new Map<string, Node>();
+  const pending: unknown[] = [document.contents];
+  let examined = 0;
+  while (pending.length && examined++ < 1_000_000) {
+    const node = pending.pop();
+    if (isAlias(node)) {
+      const target = anchors.get(node.source);
+      if (target) targets.set(node, target);
+    } else if (isMap(node) || isSeq(node) || isScalar(node)) {
+      if (node.anchor) anchors.set(node.anchor, node);
+      if (isMap(node)) {
+        for (let i = node.items.length - 1; i >= 0; i--) {
+          pending.push(node.items[i].value, node.items[i].key);
+        }
+      } else if (isSeq(node)) {
+        for (let i = node.items.length - 1; i >= 0; i--) pending.push(node.items[i]);
       }
     }
   }
+  return targets;
+}
 
-  return hitLines;
+function resolve(node: unknown, targets: WeakMap<Alias, Node>): Node | undefined {
+  if (isAlias(node)) return targets.get(node);
+  return isMap(node) || isSeq(node) || isScalar(node) ? node : undefined;
+}
+
+function field(node: unknown, key: string, targets: WeakMap<Alias, Node>): Node | undefined {
+  const map = resolve(node, targets);
+  if (!isMap(map)) return undefined;
+  for (let i = map.items.length - 1; i >= 0; i--) {
+    const entry = map.items[i];
+    if (isScalar(entry.key) && entry.key.value === key) return resolve(entry.value, targets);
+  }
+  return undefined;
+}
+
+function scalar(node: unknown): unknown {
+  return isScalar(node) ? node.value : undefined;
 }
 
 export const k8sPrivilegedWorkloadMatcher: MatcherPlugin = {
@@ -256,7 +89,7 @@ export const k8sPrivilegedWorkloadMatcher: MatcherPlugin = {
   slug: "k8s-privileged-workload",
   description:
     "Kubernetes workload enabling privileged execution, host access, or dangerous capabilities",
-  filePatterns: ["**/*.yaml", "**/*.yml"],
+  filePatterns: ["**/*.yaml", "**/*.yml", "**/*.json"],
   examples: [
     `apiVersion: v1\nkind: Pod\nspec:\n  containers:\n    - securityContext:\n        privileged: true`,
     `apiVersion: v1\nkind: Pod\nspec:\n  containers:\n    - securityContext: {privileged: true}`,
@@ -273,42 +106,115 @@ export const k8sPrivilegedWorkloadMatcher: MatcherPlugin = {
     `apiVersion: v1\nkind: Pod\nspec:\n  containers:\n    - securityContext:\n        capabilities:\n          add:\n            - SYS_MODULE`,
   ],
   match(content, filePath) {
-    // Helm dependency charts are vendored; first-party charts/<name>/templates are still scanned.
-    if (/(?:^|\/)(?:node_modules|vendor|\.github|charts\/[^/]+\/charts)\//.test(filePath)) {
+    if (/(?:^|\/)(?:node_modules|vendor|\.github|charts\/[^/]+\/charts)\//.test(filePath))
+      return [];
+    if (content.length > MAX_CONTENT_LENGTH) return [];
+
+    const lineCounter = new LineCounter();
+    let documents: Document[];
+    try {
+      // Kubernetes uses YAML 1.1 scalars, including yes/on and alternative integer spellings.
+      documents = parseAllDocuments(content, {
+        version: "1.1",
+        lineCounter,
+        prettyErrors: false,
+        uniqueKeys: false,
+      });
+    } catch {
       return [];
     }
-
-    const lines = content.split("\n");
-    const hits = new Map<string, number[]>();
-    const record = (label: string, lineNumber: number) => {
-      const lineNumbers = hits.get(label);
-      if (lineNumbers) lineNumbers.push(lineNumber);
-      else hits.set(label, [lineNumber]);
+    const hits = new Map<string, Set<number>>();
+    const record = (label: string, node: Node) => {
+      let locations = hits.get(label);
+      if (!locations) {
+        locations = new Set();
+        hits.set(label, locations);
+      }
+      if (locations.size < MAX_LOCATIONS && node.range)
+        locations.add(lineCounter.linePos(node.range[0]).line);
     };
 
-    for (const document of workloadDocuments(lines.map(structuralText))) {
-      const scanLines = withoutFlowMetadata(
-        withoutNested(withoutNested(podSettingLines(document), BLOCK_SCALAR), BLOCK_METADATA),
-      );
-      scanLines.forEach((line, index) => {
-        for (const { regex, label } of PATTERNS) {
-          if (regex.test(line)) record(label, document.lineOffset + index + 1);
+    for (const document of documents) {
+      if (document.errors.length) continue;
+      const targets = aliasTargets(document);
+      const get = (node: unknown, key: string) => field(node, key, targets);
+      const check = (node: unknown, key: string, value: unknown, label: string) => {
+        const found = get(node, key);
+        if (found && scalar(found) === value) record(label, found);
+      };
+      const securityContext = (node: unknown) => {
+        check(node, "privileged", true, LABELS[0]);
+        check(node, "allowPrivilegeEscalation", true, LABELS[1]);
+        check(get(node, "windowsOptions"), "hostProcess", true, LABELS[3]);
+        check(node, "runAsUser", 0, LABELS[4]);
+        check(node, "procMount", "Unmasked", LABELS[6]);
+        const add = get(get(node, "capabilities"), "add");
+        if (isSeq(add)) {
+          for (const item of add.items) {
+            const value = resolve(item, targets);
+            if (value && DANGEROUS_CAPABILITIES.has(String(scalar(value))))
+              record(LABELS[7], value);
+          }
         }
-      });
-      for (const lineNumber of dangerousCapabilityLines(scanLines)) {
-        record(CAPABILITY_LABEL, document.lineOffset + lineNumber);
+      };
+      const pending: { node: unknown; inheritedKind?: string }[] = [{ node: document.contents }];
+      const visited = new Set<Node>();
+      let examined = 0;
+      while (pending.length && examined++ < MAX_WORKLOADS) {
+        const { node, inheritedKind } = pending.pop()!;
+        const resource = resolve(node, targets);
+        if (!resource || visited.has(resource)) continue;
+        visited.add(resource);
+        const kind = scalar(get(resource, "kind")) ?? inheritedKind;
+        if (typeof kind !== "string") continue;
+        if (!inheritedKind && typeof scalar(get(resource, "apiVersion")) !== "string") continue;
+        if (kind.endsWith("List")) {
+          const items = get(resource, "items");
+          if (isSeq(items)) {
+            const itemKind = kind.slice(0, -4) || undefined;
+            for (let i = items.items.length - 1; i >= 0 && pending.length < MAX_WORKLOADS; i--) {
+              pending.push({ node: items.items[i], inheritedKind: itemKind });
+            }
+          }
+          continue;
+        }
+        if (!WORKLOAD_KINDS.has(kind)) continue;
+        let spec = get(resource, "spec");
+        if (kind === "PodTemplate") spec = get(get(resource, "template"), "spec");
+        else if (kind === "CronJob")
+          spec = get(get(get(get(spec, "jobTemplate"), "spec"), "template"), "spec");
+        else if (kind !== "Pod") spec = get(get(spec, "template"), "spec");
+        for (const key of ["hostIPC", "hostNetwork", "hostPID"]) check(spec, key, true, LABELS[2]);
+        securityContext(get(spec, "securityContext"));
+        for (const key of ["containers", "initContainers", "ephemeralContainers"]) {
+          const containers = get(spec, key);
+          if (isSeq(containers))
+            for (const container of containers.items)
+              securityContext(get(container, "securityContext"));
+        }
+        const volumes = get(spec, "volumes");
+        if (isSeq(volumes)) {
+          for (const volume of volumes.items) {
+            const hostPath = get(volume, "hostPath");
+            if (isMap(hostPath)) record(LABELS[5], hostPath);
+          }
+        }
       }
     }
-
+    const lines = content.split("\n");
     return LABELS.flatMap((label): CandidateMatch[] => {
-      const lineNumbers = hits.get(label);
-      if (!lineNumbers) return [];
+      const locations = hits.get(label);
+      if (!locations?.size) return [];
+      const lineNumbers = [...locations].sort((a, b) => a - b);
       const first = lineNumbers[0];
       return [
         {
           vulnSlug: "k8s-privileged-workload",
           lineNumbers,
-          snippet: lines.slice(Math.max(0, first - 3), first + 2).join("\n"),
+          snippet: lines
+            .slice(Math.max(0, first - 3), first + 2)
+            .join("\n")
+            .slice(0, 2048),
           matchedPattern: label,
         },
       ];

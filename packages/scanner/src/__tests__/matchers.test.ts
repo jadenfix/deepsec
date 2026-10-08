@@ -319,14 +319,13 @@ spec:
     expect(k8sPrivilegedWorkloadMatcher.match(content, "deploy/pod.yaml")).toEqual([]);
   });
 
-  it("handles very large manifests", () => {
+  it("skips manifests beyond the parser input budget", () => {
     const containers = Array.from({ length: 200_000 }, (_, i) => `    - name: c${i}`);
     const content = ["apiVersion: v1", "kind: Pod", "spec:", "  containers:", ...containers]
       .concat("  hostPID: true")
       .join("\n");
     const matches = k8sPrivilegedWorkloadMatcher.match(content, "deploy/pod.yaml");
-    expect(matches.map((match) => match.matchedPattern)).toEqual(["host namespace shared"]);
-    expect(matches[0].lineNumbers).toEqual([200_005]);
+    expect(matches).toEqual([]);
   });
 
   it("ignores settings that only appear inside quoted values or comments", () => {
@@ -525,5 +524,159 @@ spec:
     expect(matches.map((match) => [match.matchedPattern, match.lineNumbers])).toEqual([
       ["host namespace shared", [1, 7]],
     ]);
+  });
+});
+
+describe("k8s privileged workload syntax boundaries", () => {
+  it("scans JSON and flow lists with multiline capabilities", () => {
+    expect(k8sPrivilegedWorkloadMatcher.filePatterns).toContain("**/*.json");
+    const content = JSON.stringify(
+      {
+        apiVersion: "v1",
+        kind: "List",
+        items: [
+          {
+            apiVersion: "v1",
+            kind: "Pod",
+            spec: {
+              containers: [
+                {
+                  securityContext: {
+                    privileged: true,
+                    capabilities: { add: ["SYS_ADMIN"] },
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+      null,
+      2,
+    );
+    expect(
+      k8sPrivilegedWorkloadMatcher
+        .match(content, "deployment.json")
+        .map((hit) => hit.matchedPattern),
+    ).toEqual(["privileged container", "dangerous Linux capability"]);
+    const flow = "{apiVersion: v1, kind: PodList, items: [{spec: {hostPID: true}}]}";
+    expect(
+      k8sPrivilegedWorkloadMatcher.match(flow, "pods.yaml").map((hit) => hit.matchedPattern),
+    ).toEqual(["host namespace shared"]);
+  });
+
+  it("splits commented separators and retains original source lines", () => {
+    const content =
+      "apiVersion: v1\nkind: ConfigMap\ndata: {}\n--- # generated\napiVersion: v1\nkind: Pod\nspec:\n  hostPID: true";
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "pods.yaml")[0].lineNumbers).toEqual([8]);
+  });
+
+  it("only detects hostPath in volume definitions", () => {
+    const content = `apiVersion: v1
+kind: Pod
+spec:
+  nodeSelector: {hostPath: linux}
+  volumes:
+    - csi: {driver: example.com, volumeAttributes: {hostPath: linux}}
+    - hostPath: {path: /}`;
+    expect(
+      k8sPrivilegedWorkloadMatcher
+        .match(content, "pods.yaml")
+        .map((hit) => [hit.matchedPattern, hit.lineNumbers]),
+    ).toEqual([["host filesystem mount", [7]]]);
+  });
+
+  it.each(["+0", "00", "0x0"])("recognizes YAML root UID %s", (uid) => {
+    const content = `apiVersion: v1\nkind: Pod\nspec:\n  securityContext: {runAsUser: ${uid}}`;
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "pods.yaml")[0].matchedPattern).toBe(
+      "container runs as root UID",
+    );
+  });
+
+  it("checks CronJob, init and ephemeral container security contexts", () => {
+    const content = `apiVersion: batch/v1
+kind: CronJob
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          initContainers:
+            - securityContext: {privileged: true}
+          ephemeralContainers:
+            - securityContext: {allowPrivilegeEscalation: true}`;
+    expect(
+      k8sPrivilegedWorkloadMatcher.match(content, "job.yaml").map((hit) => hit.matchedPattern),
+    ).toEqual(["privileged container", "privilege escalation allowed"]);
+  });
+
+  it("does not interpret arbitrary keys or quoted scalars as pod settings", () => {
+    const content = `apiVersion: v1
+kind: Pod
+metadata: {annotations: {privileged: true}}
+spec:
+  nodeSelector: {privileged: true, runAsUser: 0}
+  containers:
+    - env: [{name: X, value: 'privileged: true'}]
+      securityContext: {privileged: "true", runAsUser: "0"}`;
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "pods.yaml")).toEqual([]);
+  });
+
+  it("caps persisted locations and snippets", () => {
+    const containers = Array.from(
+      { length: 200 },
+      () => "    - securityContext: {privileged: true}",
+    );
+    const content = ["apiVersion: v1", "kind: Pod", "spec:", "  containers:", ...containers].join(
+      "\n",
+    );
+    const [hit] = k8sPrivilegedWorkloadMatcher.match(content, "pods.yaml");
+    expect(hit.lineNumbers).toHaveLength(64);
+    expect(hit.snippet.length).toBeLessThanOrEqual(2048);
+    expect(hit.lineNumbers[0]).toBe(5);
+  });
+
+  it("handles repeated add keys without backward or forward scans", () => {
+    const content = [
+      "apiVersion: v1",
+      "kind: Pod",
+      "spec:",
+      ...Array.from({ length: 20_000 }, (_, i) => `  unrelated${i}: {add: []}`),
+    ].join("\n");
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "pods.yaml")).toEqual([]);
+  });
+
+  it("bounds alias cycles and skips invalid or oversized documents", () => {
+    const cycle =
+      "apiVersion: v1\nkind: List\nitems: &items [{apiVersion: v1, kind: List, items: *items}]";
+    expect(k8sPrivilegedWorkloadMatcher.match(cycle, "pods.yaml")).toEqual([]);
+    expect(k8sPrivilegedWorkloadMatcher.match("{invalid", "pods.yaml")).toEqual([]);
+    expect(k8sPrivilegedWorkloadMatcher.match(" ".repeat(1024 * 1024 + 1), "pods.yaml")).toEqual(
+      [],
+    );
+  });
+});
+
+describe("k8s privileged workload aliases", () => {
+  it("resolves aliases once and deduplicates their source locations", () => {
+    const content = [
+      "apiVersion: v1",
+      "kind: Pod",
+      "spec:",
+      "  securityContext: &context {runAsUser: 0}",
+      "  containers:",
+      ...Array.from({ length: 1000 }, () => "    - securityContext: *context"),
+    ].join("\n");
+    expect(
+      k8sPrivilegedWorkloadMatcher
+        .match(content, "pod.yaml")
+        .map((hit) => [hit.matchedPattern, hit.lineNumbers]),
+    ).toEqual([["container runs as root UID", [4]]]);
+  });
+
+  it("uses the last mapping entry for duplicate Kubernetes fields", () => {
+    const content =
+      "apiVersion: v1\nkind: Pod\nspec:\n  containers:\n    - securityContext: {privileged: true, privileged: false}";
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "pod.yaml")).toEqual([]);
   });
 });
