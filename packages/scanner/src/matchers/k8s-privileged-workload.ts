@@ -36,7 +36,8 @@ const DANGEROUS_CAPABILITIES = new Set([
   "SYS_PTRACE",
   "SYS_RAWIO",
 ]);
-const MAX_CONTENT_LENGTH = 1024 * 1024;
+const MAX_DOCUMENT_LENGTH = 1024 * 1024;
+const MAX_CONTENT_LENGTH = 16 * MAX_DOCUMENT_LENGTH;
 const MAX_LOCATIONS = 64;
 const MAX_WORKLOADS = 100_000;
 
@@ -70,14 +71,61 @@ function resolve(node: unknown, targets: WeakMap<Alias, Node>): Node | undefined
   return isMap(node) || isSeq(node) || isScalar(node) ? node : undefined;
 }
 
-function field(node: unknown, key: string, targets: WeakMap<Alias, Node>): Node | undefined {
+// Explicit keys win over `<<` merges; earlier merge sources win over later ones.
+function field(
+  node: unknown,
+  key: string,
+  targets: WeakMap<Alias, Node>,
+  seen = new Set<Node>(),
+): Node | undefined {
   const map = resolve(node, targets);
-  if (!isMap(map)) return undefined;
+  if (!isMap(map) || seen.has(map)) return undefined;
+  seen.add(map);
+  const merges: unknown[] = [];
   for (let i = map.items.length - 1; i >= 0; i--) {
     const entry = map.items[i];
-    if (isScalar(entry.key) && entry.key.value === key) return resolve(entry.value, targets);
+    if (!isScalar(entry.key)) continue;
+    if (entry.key.value === key) return resolve(entry.value, targets);
+    if (typeof entry.key.value === "symbol") merges.unshift(entry.value);
+  }
+  for (const merge of merges) {
+    const sources = resolve(merge, targets);
+    for (const source of isSeq(sources) ? sources.items : [sources]) {
+      const found = field(source, key, targets, seen);
+      if (found) return found;
+    }
   }
   return undefined;
+}
+
+// Blank out Go template actions without moving offsets, so Helm templates parse as YAML.
+// Lines holding only actions become whitespace; inline actions become a plain scalar.
+function maskTemplates(content: string): string {
+  if (!content.includes("{{")) return content;
+  const action = /\{\{[^\n]*?\}\}/g;
+  return content
+    .split("\n")
+    .map((line) => {
+      if (!line.includes("{{")) return line;
+      const fill = line.replace(action, "").trim() ? "_" : " ";
+      return line.replace(action, (match) => fill.repeat(match.length));
+    })
+    .join("\n");
+}
+
+// Split at document markers so one oversized document doesn't hide the rest of a bundle.
+function documentChunks(content: string): { text: string; line: number }[] {
+  const chunks: { text: string; line: number }[] = [];
+  const lines = content.split("\n");
+  let start = 0;
+  for (let i = 1; i <= lines.length; i++) {
+    if (i === lines.length || /^---(?:\s|$)/.test(lines[i])) {
+      const text = lines.slice(start, i).join("\n");
+      if (text.length <= MAX_DOCUMENT_LENGTH) chunks.push({ text, line: start });
+      start = i;
+    }
+  }
+  return chunks;
 }
 
 function scalar(node: unknown): unknown {
@@ -108,95 +156,97 @@ export const k8sPrivilegedWorkloadMatcher: MatcherPlugin = {
   match(content, filePath) {
     if (/(?:^|\/)(?:node_modules|vendor|\.github|charts\/[^/]+\/charts)\//.test(filePath))
       return [];
-    if (content.length > MAX_CONTENT_LENGTH) return [];
+    if (content.length > MAX_CONTENT_LENGTH || !content.includes("kind")) return [];
 
-    const lineCounter = new LineCounter();
-    let documents: Document[];
-    try {
-      // Kubernetes uses YAML 1.1 scalars, including yes/on and alternative integer spellings.
-      documents = parseAllDocuments(content, {
-        version: "1.1",
-        lineCounter,
-        prettyErrors: false,
-        uniqueKeys: false,
-      });
-    } catch {
-      return [];
-    }
     const hits = new Map<string, Set<number>>();
-    const record = (label: string, node: Node) => {
-      let locations = hits.get(label);
-      if (!locations) {
-        locations = new Set();
-        hits.set(label, locations);
+    for (const chunk of documentChunks(maskTemplates(content))) {
+      const lineCounter = new LineCounter();
+      let documents: Document[];
+      try {
+        // Kubernetes uses YAML 1.1 scalars, including yes/on and alternative integer spellings.
+        documents = parseAllDocuments(chunk.text, {
+          version: "1.1",
+          lineCounter,
+          prettyErrors: false,
+          uniqueKeys: false,
+        });
+      } catch {
+        continue;
       }
-      if (locations.size < MAX_LOCATIONS && node.range)
-        locations.add(lineCounter.linePos(node.range[0]).line);
-    };
-
-    for (const document of documents) {
-      if (document.errors.length) continue;
-      const targets = aliasTargets(document);
-      const get = (node: unknown, key: string) => field(node, key, targets);
-      const check = (node: unknown, key: string, value: unknown, label: string) => {
-        const found = get(node, key);
-        if (found && scalar(found) === value) record(label, found);
-      };
-      const securityContext = (node: unknown) => {
-        check(node, "privileged", true, LABELS[0]);
-        check(node, "allowPrivilegeEscalation", true, LABELS[1]);
-        check(get(node, "windowsOptions"), "hostProcess", true, LABELS[3]);
-        check(node, "runAsUser", 0, LABELS[4]);
-        check(node, "procMount", "Unmasked", LABELS[6]);
-        const add = get(get(node, "capabilities"), "add");
-        if (isSeq(add)) {
-          for (const item of add.items) {
-            const value = resolve(item, targets);
-            if (value && DANGEROUS_CAPABILITIES.has(String(scalar(value))))
-              record(LABELS[7], value);
-          }
+      const record = (label: string, node: Node) => {
+        let locations = hits.get(label);
+        if (!locations) {
+          locations = new Set();
+          hits.set(label, locations);
         }
+        if (locations.size < MAX_LOCATIONS && node.range)
+          locations.add(chunk.line + lineCounter.linePos(node.range[0]).line);
       };
-      const pending: { node: unknown; inheritedKind?: string }[] = [{ node: document.contents }];
-      const visited = new Set<Node>();
-      let examined = 0;
-      while (pending.length && examined++ < MAX_WORKLOADS) {
-        const { node, inheritedKind } = pending.pop()!;
-        const resource = resolve(node, targets);
-        if (!resource || visited.has(resource)) continue;
-        visited.add(resource);
-        const kind = scalar(get(resource, "kind")) ?? inheritedKind;
-        if (typeof kind !== "string") continue;
-        if (!inheritedKind && typeof scalar(get(resource, "apiVersion")) !== "string") continue;
-        if (kind.endsWith("List")) {
-          const items = get(resource, "items");
-          if (isSeq(items)) {
-            const itemKind = kind.slice(0, -4) || undefined;
-            for (let i = items.items.length - 1; i >= 0 && pending.length < MAX_WORKLOADS; i--) {
-              pending.push({ node: items.items[i], inheritedKind: itemKind });
+      for (const document of documents) {
+        if (document.errors.length) continue;
+        const targets = aliasTargets(document);
+        const get = (node: unknown, key: string) => field(node, key, targets);
+        const check = (node: unknown, key: string, value: unknown, label: string) => {
+          const found = get(node, key);
+          if (found && scalar(found) === value) record(label, found);
+        };
+        const securityContext = (node: unknown) => {
+          check(node, "privileged", true, LABELS[0]);
+          check(node, "allowPrivilegeEscalation", true, LABELS[1]);
+          check(get(node, "windowsOptions"), "hostProcess", true, LABELS[3]);
+          check(node, "runAsUser", 0, LABELS[4]);
+          check(node, "procMount", "Unmasked", LABELS[6]);
+          const add = get(get(node, "capabilities"), "add");
+          if (isSeq(add)) {
+            for (const item of add.items) {
+              const value = resolve(item, targets);
+              if (value && DANGEROUS_CAPABILITIES.has(String(scalar(value))))
+                record(LABELS[7], value);
             }
           }
-          continue;
-        }
-        if (!WORKLOAD_KINDS.has(kind)) continue;
-        let spec = get(resource, "spec");
-        if (kind === "PodTemplate") spec = get(get(resource, "template"), "spec");
-        else if (kind === "CronJob")
-          spec = get(get(get(get(spec, "jobTemplate"), "spec"), "template"), "spec");
-        else if (kind !== "Pod") spec = get(get(spec, "template"), "spec");
-        for (const key of ["hostIPC", "hostNetwork", "hostPID"]) check(spec, key, true, LABELS[2]);
-        securityContext(get(spec, "securityContext"));
-        for (const key of ["containers", "initContainers", "ephemeralContainers"]) {
-          const containers = get(spec, key);
-          if (isSeq(containers))
-            for (const container of containers.items)
-              securityContext(get(container, "securityContext"));
-        }
-        const volumes = get(spec, "volumes");
-        if (isSeq(volumes)) {
-          for (const volume of volumes.items) {
-            const hostPath = get(volume, "hostPath");
-            if (isMap(hostPath)) record(LABELS[5], hostPath);
+        };
+        const pending: { node: unknown; inheritedKind?: string }[] = [{ node: document.contents }];
+        const visited = new Set<Node>();
+        let examined = 0;
+        while (pending.length && examined++ < MAX_WORKLOADS) {
+          const { node, inheritedKind } = pending.pop()!;
+          const resource = resolve(node, targets);
+          if (!resource || visited.has(resource)) continue;
+          visited.add(resource);
+          const kind = scalar(get(resource, "kind")) ?? inheritedKind;
+          if (typeof kind !== "string") continue;
+          if (!inheritedKind && typeof scalar(get(resource, "apiVersion")) !== "string") continue;
+          if (kind.endsWith("List")) {
+            const items = get(resource, "items");
+            if (isSeq(items)) {
+              const itemKind = kind.slice(0, -4) || undefined;
+              for (let i = items.items.length - 1; i >= 0 && pending.length < MAX_WORKLOADS; i--) {
+                pending.push({ node: items.items[i], inheritedKind: itemKind });
+              }
+            }
+            continue;
+          }
+          if (!WORKLOAD_KINDS.has(kind)) continue;
+          let spec = get(resource, "spec");
+          if (kind === "PodTemplate") spec = get(get(resource, "template"), "spec");
+          else if (kind === "CronJob")
+            spec = get(get(get(get(spec, "jobTemplate"), "spec"), "template"), "spec");
+          else if (kind !== "Pod") spec = get(get(spec, "template"), "spec");
+          for (const key of ["hostIPC", "hostNetwork", "hostPID"])
+            check(spec, key, true, LABELS[2]);
+          securityContext(get(spec, "securityContext"));
+          for (const key of ["containers", "initContainers", "ephemeralContainers"]) {
+            const containers = get(spec, key);
+            if (isSeq(containers))
+              for (const container of containers.items)
+                securityContext(get(container, "securityContext"));
+          }
+          const volumes = get(spec, "volumes");
+          if (isSeq(volumes)) {
+            for (const volume of volumes.items) {
+              const hostPath = get(volume, "hostPath");
+              if (isMap(hostPath)) record(LABELS[5], hostPath);
+            }
           }
         }
       }

@@ -655,6 +655,63 @@ spec:
       [],
     );
   });
+
+  it("skips only the oversized document in a multi-document bundle", () => {
+    const big = `apiVersion: v1\nkind: ConfigMap\ndata:\n  blob: "${"x".repeat(1024 * 1024)}"`;
+    const pod = "apiVersion: v1\nkind: Pod\nspec:\n  hostPID: true";
+    const matches = k8sPrivilegedWorkloadMatcher.match(`${big}\n---\n${pod}`, "bundle.yaml");
+    expect(matches.map((match) => [match.matchedPattern, match.lineNumbers])).toEqual([
+      ["host namespace shared", [9]],
+    ]);
+  });
+
+  it("follows YAML merge keys, with explicit keys taking precedence", () => {
+    const content = `defaults: &ctx {privileged: true, runAsUser: 0}
+extra: &extra {allowPrivilegeEscalation: true, runAsUser: 1000}
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - securityContext:
+        <<: *ctx
+        runAsUser: 1000
+    - securityContext:
+        <<: [*extra, *ctx]
+    - securityContext: &self
+        <<: *self`;
+    const matches = k8sPrivilegedWorkloadMatcher.match(content, "pods.yaml");
+    expect(matches.map((match) => [match.matchedPattern, match.lineNumbers])).toEqual([
+      ["privileged container", [1]],
+      ["privilege escalation allowed", [2]],
+    ]);
+  });
+
+  it("scans Helm templates that contain Go template actions", () => {
+    const content = `{{- if .Values.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  template:
+    spec:
+      containers:
+        - image: "{{ .Values.image.repository }}:{{ .Chart.AppVersion }}"
+          securityContext:
+            privileged: true
+            runAsUser: {{ .Values.uid }}
+{{- end }}`;
+    const matches = k8sPrivilegedWorkloadMatcher.match(
+      content,
+      "charts/app/templates/deployment.yaml",
+    );
+    expect(matches.map((match) => [match.matchedPattern, match.lineNumbers])).toEqual([
+      ["privileged container", [14]],
+    ]);
+    expect(matches[0].snippet).toContain("{{ .Values.uid }}");
+  });
 });
 
 describe("k8s privileged workload aliases", () => {
