@@ -715,6 +715,106 @@ spec:
 });
 
 describe("k8s privileged workload aliases", () => {
+  it("preserves unmatched literal template openings and scans later documents", () => {
+    const content = `apiVersion: v1
+kind: ConfigMap
+data:
+  note: "see {{"
+---
+apiVersion: v1
+kind: Pod
+spec: {hostPID: true}`;
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "bundle.yaml")[0].lineNumbers).toEqual([8]);
+  });
+
+  it("preserves literal openings with unmatched Go quotes before valid Helm actions", () => {
+    const content = `apiVersion: v1
+kind: Pod
+metadata:
+  annotations: {note: "{{ don't }}"}
+  name: {{ .Values.name }}
+spec: {hostPID: true}`;
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "pod.yaml")[0].lineNumbers).toEqual([6]);
+  });
+
+  it.each([
+    "PERFMON",
+    "CHECKPOINT_RESTORE",
+    "SYS_RESOURCE",
+  ])("detects high-impact capability %s only when added", (capability) => {
+    const content = `apiVersion: v1\nkind: Pod\nspec: {containers: [{securityContext: {capabilities: {add: [${capability}]}}}]}`;
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "pod.yaml")[0].matchedPattern).toBe(
+      "dangerous Linux capability",
+    );
+    expect(
+      k8sPrivilegedWorkloadMatcher.match(content.replace("add:", "drop:"), "pod.yaml"),
+    ).toEqual([]);
+  });
+
+  it.each([
+    "Pod",
+    "Deployment",
+    "PodList",
+    "DeploymentList",
+  ])("ignores custom API groups that reuse workload kind %s", (kind) => {
+    const item = "{spec: {hostPID: true, template: {spec: {hostPID: true}}}}";
+    const content = `apiVersion: example.com/v1\nkind: ${kind}\nspec: {hostPID: true, template: {spec: {hostPID: true}}}\nitems: [${item}]`;
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "custom.yaml")).toEqual([]);
+  });
+
+  it("scans first-party Kubernetes manifests under .github and ignores workflows", () => {
+    const content = "apiVersion: v1\nkind: Pod\nspec: {hostPID: true}";
+    expect(
+      k8sPrivilegedWorkloadMatcher.match(content, ".github/kubernetes/pod.yaml")[0].matchedPattern,
+    ).toBe("host namespace shared");
+    expect(
+      k8sPrivilegedWorkloadMatcher.match(
+        "name: CI\non: [push]\njobs: {}",
+        ".github/workflows/ci.yml",
+      ),
+    ).toEqual([]);
+  });
+
+  it("preserves unmatched block-scalar openings before a real multiline action", () => {
+    const content = `apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    note: |
+      literal {{ fragment
+  name: {{ printf "{{%s}}"
+    .Values.name }}
+spec: {hostPID: true}`;
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "pod.yaml")[0].lineNumbers).toEqual([9]);
+  });
+
+  it.each([
+    ["apps/v1", "Deployment"],
+    ["extensions/v1beta1", "DaemonSet"],
+    ["batch/v1", "Job"],
+    ["argoproj.io/v1alpha1", "Rollout"],
+    ["apps.openshift.io/v1", "DeploymentConfig"],
+  ])("scans %s %s and inherits the API version in its typed list", (apiVersion, kind) => {
+    const content = `apiVersion: ${apiVersion}\nkind: ${kind}List\nitems:\n- spec: {template: {spec: {hostPID: true}}}`;
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "workload.yaml")[0].lineNumbers).toEqual([
+      4,
+    ]);
+    expect(
+      k8sPrivilegedWorkloadMatcher.match(
+        content.replace(`${kind}List`, kind).replace("items:\n- spec:", "spec:"),
+        "workload.yaml",
+      )[0].matchedPattern,
+    ).toBe("host namespace shared");
+  });
+
+  it.each([
+    "apps/v1",
+    "bogus",
+    "v1/invalid",
+  ])("does not treat %s Pods as core workloads", (apiVersion) => {
+    const content = `apiVersion: ${apiVersion}\nkind: Pod\nspec: {hostPID: true}`;
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "pod.yaml")).toEqual([]);
+  });
   it("follows deep merge chains without using the JavaScript call stack", () => {
     const content = [
       "defaults: &a0 {privileged: true}",

@@ -3,19 +3,26 @@ import type { Alias, Document, Node } from "yaml";
 import { isAlias, isMap, isScalar, isSeq, LineCounter, parseAllDocuments } from "yaml";
 import type { MatcherPlugin } from "../types.js";
 
-const WORKLOAD_KINDS = new Set([
-  "CronJob",
-  "DaemonSet",
-  "Deployment",
-  "DeploymentConfig",
-  "Job",
-  "Pod",
-  "PodTemplate",
-  "ReplicaSet",
-  "ReplicationController",
-  "Rollout",
-  "StatefulSet",
+const WORKLOAD_API_GROUPS = new Map<string, readonly string[]>([
+  ["CronJob", ["batch"]],
+  ["DaemonSet", ["apps", "extensions"]],
+  ["Deployment", ["apps", "extensions"]],
+  ["DeploymentConfig", ["apps.openshift.io"]],
+  ["Job", ["batch"]],
+  ["Pod", [""]],
+  ["PodTemplate", [""]],
+  ["ReplicaSet", ["apps", "extensions"]],
+  ["ReplicationController", [""]],
+  ["Rollout", ["argoproj.io"]],
+  ["StatefulSet", ["apps"]],
 ]);
+
+function apiGroup(version: unknown): string | undefined {
+  if (typeof version !== "string") return undefined;
+  const match = /^(?:([^/]+)\/)?v\d+(?:(?:alpha|beta)\d+)?$/.exec(version);
+  return match ? (match[1] ?? "") : undefined;
+}
+
 const LABELS = [
   "privileged container",
   "privilege escalation allowed",
@@ -30,14 +37,17 @@ const DANGEROUS_CAPABILITIES = new Set([
   "ALL",
   "AUDIT_CONTROL",
   "BPF",
+  "CHECKPOINT_RESTORE",
   "DAC_READ_SEARCH",
   "IPC_OWNER",
   "NET_ADMIN",
+  "PERFMON",
   "SYS_ADMIN",
   "SYS_BOOT",
   "SYS_MODULE",
   "SYS_PTRACE",
   "SYS_RAWIO",
+  "SYS_RESOURCE",
   "SYS_TIME",
 ]);
 const MAX_DOCUMENT_LENGTH = 1024 * 1024;
@@ -132,20 +142,24 @@ function maskTemplates(content: string): string | undefined {
     [];
   let start = 0;
   let line = 0;
+  let remaining = 2 * content.length;
+  let examined = 0;
   while (start < content.length) {
     const open = content.indexOf("{{", start);
     if (open === -1) break;
-    if (actions.length >= 100_000) return undefined;
+    if (examined++ >= 100_000 || remaining <= 0) return undefined;
     const before = content.slice(start, open);
     blanks.push(before);
     line += before.split("\n").length - 1;
     let end = open + 2;
     let quote = "";
     let comment = false;
+    const limit = Math.min(content.length, open + 65_536);
     let firstToken = end + Number(content[end] === "-");
-    while (/\s/.test(content[firstToken] ?? "") && firstToken < content.length) firstToken++;
+    while (firstToken < limit && /\s/.test(content[firstToken])) firstToken++;
     const commentAction = content.startsWith("/*", firstToken);
-    while (end < content.length) {
+    let closed = false;
+    while (end < limit && remaining-- > 0) {
       if (comment) {
         if (content.startsWith("*/", end)) {
           comment = false;
@@ -154,14 +168,22 @@ function maskTemplates(content: string): string | undefined {
       } else if (quote) {
         if (content[end] === "\\" && quote !== "`") end += 2;
         else if (content[end++] === quote) quote = "";
+      } else if (content.startsWith("{{", end)) {
+        break;
       } else if (content.startsWith("/*", end)) {
         comment = true;
         end += 2;
       } else if (content.startsWith("}}", end)) {
         end += 2;
+        closed = true;
         break;
       } else if ("\"'`".includes(content[end])) quote = content[end++];
       else end++;
+    }
+    if (!closed) {
+      blanks.push("{{");
+      start = open + 2;
+      continue;
     }
     end = Math.min(end, content.length);
     const action = content.slice(open, end);
@@ -238,8 +260,7 @@ export const k8sPrivilegedWorkloadMatcher: MatcherPlugin = {
     `apiVersion: v1\nkind: Pod\nspec:\n  containers:\n    - securityContext:\n        capabilities:\n          add:\n            - SYS_MODULE`,
   ],
   match(content, filePath) {
-    if (/(?:^|\/)(?:node_modules|vendor|\.github|charts\/[^/]+\/charts)\//.test(filePath))
-      return [];
+    if (/(?:^|\/)(?:node_modules|vendor|charts\/[^/]+\/charts)\//.test(filePath)) return [];
     if (content.length > MAX_CONTENT_LENGTH) return [];
 
     const masked = maskTemplates(content);
@@ -291,28 +312,38 @@ export const k8sPrivilegedWorkloadMatcher: MatcherPlugin = {
             }
           }
         };
-        const pending: { node: unknown; inheritedKind?: string }[] = [{ node: document.contents }];
+        const pending: { node: unknown; inheritedKind?: string; inheritedApiVersion?: string }[] = [
+          { node: document.contents },
+        ];
         const visited = new Set<Node>();
         let examined = 0;
         while (pending.length && examined++ < MAX_WORKLOADS) {
-          const { node, inheritedKind } = pending.pop()!;
+          const { node, inheritedKind, inheritedApiVersion } = pending.pop()!;
           const resource = resolve(node, targets);
           if (!resource || visited.has(resource)) continue;
           visited.add(resource);
           const kind = scalar(get(resource, "kind")) ?? inheritedKind;
           if (typeof kind !== "string") continue;
-          if (!inheritedKind && typeof scalar(get(resource, "apiVersion")) !== "string") continue;
+          const version = scalar(get(resource, "apiVersion")) ?? inheritedApiVersion;
+          const group = apiGroup(version);
+          if (group === undefined) continue;
           if (kind.endsWith("List")) {
+            const itemKind = kind.slice(0, -4) || undefined;
+            if (itemKind ? !WORKLOAD_API_GROUPS.get(itemKind)?.includes(group) : group !== "")
+              continue;
             const items = get(resource, "items");
             if (isSeq(items)) {
-              const itemKind = kind.slice(0, -4) || undefined;
               for (let i = items.items.length - 1; i >= 0 && pending.length < MAX_WORKLOADS; i--) {
-                pending.push({ node: items.items[i], inheritedKind: itemKind });
+                pending.push({
+                  node: items.items[i],
+                  inheritedKind: itemKind,
+                  inheritedApiVersion: itemKind ? String(version) : undefined,
+                });
               }
             }
             continue;
           }
-          if (!WORKLOAD_KINDS.has(kind)) continue;
+          if (!WORKLOAD_API_GROUPS.get(kind)?.includes(group)) continue;
           let spec = get(resource, "spec");
           if (kind === "PodTemplate") spec = get(get(resource, "template"), "spec");
           else if (kind === "CronJob")
