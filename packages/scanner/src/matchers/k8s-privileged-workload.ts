@@ -28,13 +28,17 @@ const LABELS = [
 ];
 const DANGEROUS_CAPABILITIES = new Set([
   "ALL",
+  "AUDIT_CONTROL",
   "BPF",
   "DAC_READ_SEARCH",
+  "IPC_OWNER",
   "NET_ADMIN",
   "SYS_ADMIN",
+  "SYS_BOOT",
   "SYS_MODULE",
   "SYS_PTRACE",
   "SYS_RAWIO",
+  "SYS_TIME",
 ]);
 const MAX_DOCUMENT_LENGTH = 1024 * 1024;
 const MAX_CONTENT_LENGTH = 16 * MAX_DOCUMENT_LENGTH;
@@ -72,45 +76,125 @@ function resolve(node: unknown, targets: WeakMap<Alias, Node>): Node | undefined
 }
 
 // Explicit keys win over `<<` merges; earlier merge sources win over later ones.
-function field(
-  node: unknown,
-  key: string,
-  targets: WeakMap<Alias, Node>,
-  seen = new Set<Node>(),
-): Node | undefined {
-  const map = resolve(node, targets);
-  if (!isMap(map) || seen.has(map)) return undefined;
-  seen.add(map);
-  const merges: unknown[] = [];
-  for (let i = map.items.length - 1; i >= 0; i--) {
-    const entry = map.items[i];
-    if (!isScalar(entry.key)) continue;
-    if (entry.key.value === key) return resolve(entry.value, targets);
-    if (typeof entry.key.value === "symbol") merges.unshift(entry.value);
-  }
-  for (const merge of merges) {
-    const sources = resolve(merge, targets);
-    for (const source of isSeq(sources) ? sources.items : [sources]) {
-      const found = field(source, key, targets, seen);
-      if (found) return found;
+function fieldLookup(targets: WeakMap<Alias, Node>) {
+  const indexes = new WeakMap<
+    Node,
+    { explicit: Map<unknown, Node | undefined>; merges: unknown[] }
+  >();
+  const results = new WeakMap<Node, Map<string, Node | undefined>>();
+  let remaining = 1_000_000;
+  return (node: unknown, key: string): Node | undefined => {
+    const root = resolve(node, targets);
+    if (!isMap(root)) return undefined;
+    const cached = results.get(root);
+    if (cached?.has(key)) return cached.get(key);
+    const pending: unknown[] = [root];
+    const seen = new Set<Node>();
+    let found: Node | undefined;
+    while (pending.length && remaining-- > 0) {
+      const map = resolve(pending.pop(), targets);
+      if (!isMap(map) || seen.has(map)) continue;
+      seen.add(map);
+      let index = indexes.get(map);
+      if (!index) {
+        index = { explicit: new Map(), merges: [] };
+        for (const entry of map.items) {
+          if (remaining-- <= 0) return undefined;
+          if (!isScalar(entry.key)) continue;
+          if (typeof entry.key.value === "symbol") {
+            const sources = resolve(entry.value, targets);
+            for (const source of isSeq(sources) ? sources.items : [sources]) {
+              if (remaining-- <= 0) return undefined;
+              index.merges.push(source);
+            }
+          } else index.explicit.set(entry.key.value, resolve(entry.value, targets));
+        }
+        indexes.set(map, index);
+      }
+      if (index.explicit.has(key)) {
+        found = index.explicit.get(key);
+        break;
+      }
+      for (let i = index.merges.length - 1; i >= 0; i--) pending.push(index.merges[i]);
     }
-  }
-  return undefined;
+    const cache = cached ?? new Map<string, Node | undefined>();
+    cache.set(key, found);
+    results.set(root, cache);
+    return found;
+  };
 }
 
-// Blank out Go template actions without moving offsets, so Helm templates parse as YAML.
-// Lines holding only actions become whitespace; inline actions become a plain scalar.
-function maskTemplates(content: string): string {
+// Preserve source offsets while masking Go actions, including strings and block comments.
+function maskTemplates(content: string): string | undefined {
   if (!content.includes("{{")) return content;
-  const action = /\{\{[^\n]*?\}\}/g;
-  return content
+  const blanks: string[] = [];
+  const actions: { open: number; end: number; line: number; endLine: number; comment: boolean }[] =
+    [];
+  let start = 0;
+  let line = 0;
+  while (start < content.length) {
+    const open = content.indexOf("{{", start);
+    if (open === -1) break;
+    if (actions.length >= 100_000) return undefined;
+    const before = content.slice(start, open);
+    blanks.push(before);
+    line += before.split("\n").length - 1;
+    let end = open + 2;
+    let quote = "";
+    let comment = false;
+    let firstToken = end + Number(content[end] === "-");
+    while (/\s/.test(content[firstToken] ?? "") && firstToken < content.length) firstToken++;
+    const commentAction = content.startsWith("/*", firstToken);
+    while (end < content.length) {
+      if (comment) {
+        if (content.startsWith("*/", end)) {
+          comment = false;
+          end += 2;
+        } else end++;
+      } else if (quote) {
+        if (content[end] === "\\" && quote !== "`") end += 2;
+        else if (content[end++] === quote) quote = "";
+      } else if (content.startsWith("/*", end)) {
+        comment = true;
+        end += 2;
+      } else if (content.startsWith("}}", end)) {
+        end += 2;
+        break;
+      } else if ("\"'`".includes(content[end])) quote = content[end++];
+      else end++;
+    }
+    end = Math.min(end, content.length);
+    const action = content.slice(open, end);
+    const endLine = line + action.split("\n").length - 1;
+    actions.push({ open, end, line, endLine, comment: commentAction });
+    blanks.push(action.replace(/[^\r\n]/g, " "));
+    start = end;
+    line = endLine;
+  }
+  blanks.push(content.slice(start));
+  const staticLines = blanks
+    .join("")
     .split("\n")
-    .map((line) => {
-      if (!line.includes("{{")) return line;
-      const fill = line.replace(action, "").trim() ? "_" : " ";
-      return line.replace(action, (match) => fill.repeat(match.length));
-    })
-    .join("\n");
+    .map((text) => Boolean(text.trim()));
+  const output: string[] = [];
+  start = 0;
+  for (const action of actions) {
+    output.push(content.slice(start, action.open));
+    const inline = !action.comment && (staticLines[action.line] || staticLines[action.endLine]);
+    let firstLine = true;
+    output.push(
+      content.slice(action.open, action.end).replace(/[\s\S]/g, (char) => {
+        if (char === "\r" || char === "\n") {
+          firstLine = false;
+          return char;
+        }
+        return inline && firstLine ? "_" : " ";
+      }),
+    );
+    start = action.end;
+  }
+  output.push(content.slice(start));
+  return output.join("");
 }
 
 // Split at document markers so one oversized document doesn't hide the rest of a bundle.
@@ -156,10 +240,12 @@ export const k8sPrivilegedWorkloadMatcher: MatcherPlugin = {
   match(content, filePath) {
     if (/(?:^|\/)(?:node_modules|vendor|\.github|charts\/[^/]+\/charts)\//.test(filePath))
       return [];
-    if (content.length > MAX_CONTENT_LENGTH || !content.includes("kind")) return [];
+    if (content.length > MAX_CONTENT_LENGTH) return [];
 
+    const masked = maskTemplates(content);
+    if (masked === undefined) return [];
     const hits = new Map<string, Set<number>>();
-    for (const chunk of documentChunks(maskTemplates(content))) {
+    for (const chunk of documentChunks(masked)) {
       const lineCounter = new LineCounter();
       let documents: Document[];
       try {
@@ -185,7 +271,7 @@ export const k8sPrivilegedWorkloadMatcher: MatcherPlugin = {
       for (const document of documents) {
         if (document.errors.length) continue;
         const targets = aliasTargets(document);
-        const get = (node: unknown, key: string) => field(node, key, targets);
+        const get = fieldLookup(targets);
         const check = (node: unknown, key: string, value: unknown, label: string) => {
           const found = get(node, key);
           if (found && scalar(found) === value) record(label, found);

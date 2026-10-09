@@ -715,6 +715,113 @@ spec:
 });
 
 describe("k8s privileged workload aliases", () => {
+  it("follows deep merge chains without using the JavaScript call stack", () => {
+    const content = [
+      "defaults: &a0 {privileged: true}",
+      ...Array.from({ length: 12_000 }, (_, i) => `x${i + 1}: &a${i + 1} {<<: *a${i}}`),
+      "apiVersion: v1",
+      "kind: Pod",
+      "spec: {containers: [{securityContext: *a12000}]}",
+    ].join("\n");
+    expect(content.length).toBeLessThan(1024 * 1024);
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "pod.yaml")[0].lineNumbers).toEqual([1]);
+  });
+
+  it("uses explicit values and the first merge source even with cyclic merges", () => {
+    const content = `safe: &safe {privileged: false}
+dangerous: &dangerous {privileged: true}
+cycle: &cycle {<<: [*cycle, *safe]}
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - securityContext: {<<: [*safe, *dangerous]}
+    - securityContext: {privileged: false, <<: *dangerous}
+    - securityContext: {<<: *dangerous, privileged: null}
+    - securityContext: {<<: *cycle}`;
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "pod.yaml")).toEqual([]);
+  });
+
+  it.each(["json", "yaml"])("reads escaped Kubernetes field names in %s", (extension) => {
+    const content = '{"apiVersion": "v1", "k\\u0069nd": "Pod", "spec": {"hostPID": true}}';
+    expect(k8sPrivilegedWorkloadMatcher.match(content, `pod.${extension}`)[0].matchedPattern).toBe(
+      "host namespace shared",
+    );
+  });
+
+  it("masks multiline Helm actions, quoted delimiters, and comments without moving lines", () => {
+    const content = `{{- /*
+This comment includes }} and a fake manifest:
+apiVersion: v1
+kind: Pod
+spec: {hostPID: true}
+*/ -}}
+{{- if
+  .Values.enabled
+}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ printf "}}%s"
+    .Values.name }}
+spec:
+  containers:
+    - securityContext: {privileged: true}
+{{- end }}`;
+    const [hit] = k8sPrivilegedWorkloadMatcher.match(content, "charts/app/templates/pod.yaml");
+    expect(hit.matchedPattern).toBe("privileged container");
+    expect(hit.lineNumbers).toEqual([17]);
+    expect(hit.snippet).toContain("privileged: true");
+  });
+
+  it("masks adjacent standalone Helm actions and inline multiline comments", () => {
+    const content = `{{ if .Values.enabled }}{{ end }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app {{- /*
+    comment with a closing delimiter }}
+  */ -}}
+spec: {hostPID: true}`;
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "pod.yaml")[0].lineNumbers).toEqual([8]);
+  });
+
+  it("bounds template-action processing", () => {
+    const content = `${"{{}}".repeat(100_001)}\napiVersion: v1\nkind: Pod\nspec: {hostPID: true}`;
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "pod.yaml")).toEqual([]);
+  });
+
+  it("bounds lookup work in wide cyclic merge graphs without expanding aliases", () => {
+    const content = [
+      "cycle: &cycle {<<: *cycle}",
+      `wide: &wide {<<: [${Array.from({ length: 140_000 }, () => "*cycle").join(",")}]}`,
+      "apiVersion: v1",
+      "kind: Pod",
+      "spec: {securityContext: *wide, hostPID: true}",
+    ].join("\n");
+    expect(content.length).toBeLessThan(1024 * 1024);
+    expect(k8sPrivilegedWorkloadMatcher.match(content, "pod.yaml")[0].matchedPattern).toBe(
+      "host namespace shared",
+    );
+  });
+
+  it.each([
+    "SYS_BOOT",
+    "SYS_TIME",
+    "AUDIT_CONTROL",
+    "IPC_OWNER",
+  ])("detects host-impacting capability %s only when added", (capability) => {
+    const prefix =
+      "apiVersion: v1\nkind: Pod\nspec:\n  containers:\n    - securityContext:\n        capabilities:";
+    const added = `${prefix}\n          add: [${capability}]`;
+    expect(k8sPrivilegedWorkloadMatcher.match(added, "pod.yaml")[0].matchedPattern).toBe(
+      "dangerous Linux capability",
+    );
+    expect(k8sPrivilegedWorkloadMatcher.match(added.replace("add:", "drop:"), "pod.yaml")).toEqual(
+      [],
+    );
+  });
+
   it("resolves aliases once and deduplicates their source locations", () => {
     const content = [
       "apiVersion: v1",
